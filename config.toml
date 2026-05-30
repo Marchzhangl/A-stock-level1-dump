@@ -2,7 +2,7 @@
 
 [server]
 # 通达信服务器配置
-host = "120.237.21.226"
+host = "129.211.70.79"
 port = 7709
 timeout_secs = 10
 retry_count = 3
@@ -17,11 +17,11 @@ max_retries = 3      # 失败重试次数
 
 [clickhouse]
 # ClickHouse数据库配置
-url = "http://localhost:8123"
+url = "http://localhost:8124"
 database = "stock_db"
 username = "stock_user"
 password = "stock_pass"
-batch_size = 1000  # 批量插入大小
+batch_size = 10000 # 批量插入大小
 
 [data]
 # 数据文件路径
