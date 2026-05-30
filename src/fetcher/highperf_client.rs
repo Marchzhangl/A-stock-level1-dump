@@ -1,220 +1,297 @@
-use anyhow::{Result, Context, anyhow};
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{timeout, Duration};
-use std::sync::Arc;
+//! 高性能 TCP 客户端（带连接池 + HELLO 复用）
+//!
+//! 协议流程：
+//! 1. 从连接池获取已认证连接（若无则新建 + HELLO 握手）
+//! 2. 循环发送分页 REQUEST 包（每次更新偏移量）
+//! 3. 使用精确帧接收：从响应头 bytes[12..14]（u16 LE）读取 body_len，用 read_exact 避免静默超时
+//! 4. 检测短页或空响应，停止分页
+//! 5. 返回连接到池，由下次调用复用
+
+use anyhow::{Context, Result};
 use parking_lot::Mutex;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
+use tracing::{debug, warn};
+
 use crate::models::MarketData;
-use super::protocol::{
-    parse_hexdump, replace_date_code, write_u32_le,
-    DEFAULT_HELLO, DEFAULT_REQUEST, OFFSET_POS1, DEFAULT_STEP
-};
 use super::extract::extract_payloads;
 use super::parser::parse_payload;
+use super::protocol::{
+    parse_hexdump, replace_date_code, write_u32_le,
+    DEFAULT_HELLO, DEFAULT_REQUEST, DEFAULT_STEP, MAGIC, OFFSET_POS1,
+};
 
-/// 已认证的连接（HELLO已完成）
-pub struct AuthenticatedStream {
+/// 等待服务器首字节的超时（毫秒）
+const FIRST_BYTE_MS: u64 = 1_000;
+/// 连接池默认容量
+const DEFAULT_POOL_SIZE: usize = 512;
+
+// ── 连接池 ────────────────────────────────────────────────────────────
+
+/// 已完成 HELLO 握手的可复用 TCP 连接
+struct AuthStream {
     stream: TcpStream,
 }
 
-/// 连接池
-pub struct ConnectionPool {
+/// TCP 连接池
+struct ConnPool {
     host: String,
     port: u16,
     timeout_secs: u64,
-    pool: Arc<Mutex<Vec<AuthenticatedStream>>>,
+    idle: Mutex<Vec<AuthStream>>,
     max_size: usize,
-    hello_template: Vec<u8>,
+    hello_bytes: Vec<u8>,
 }
 
-impl ConnectionPool {
-    pub fn new(host: String, port: u16, timeout_secs: u64, max_size: usize, hello_template: Vec<u8>) -> Self {
-        Self {
+impl ConnPool {
+    fn new(host: String, port: u16, timeout_secs: u64, max_size: usize) -> Result<Self> {
+        let hello_bytes = parse_hexdump(DEFAULT_HELLO).context("解析 HELLO 模板失败")?;
+        Ok(Self {
             host,
             port,
             timeout_secs,
-            pool: Arc::new(Mutex::new(Vec::with_capacity(max_size))),
+            idle: Mutex::new(Vec::with_capacity(max_size)),
             max_size,
-            hello_template,
-        }
+            hello_bytes,
+        })
     }
-    
-    /// 获取已认证的连接（从池中或新建+HELLO）
-    async fn get_connection(&self) -> Result<AuthenticatedStream> {
-        // 尝试从池中获取
-        if let Some(conn) = self.pool.lock().pop() {
+
+    /// 获取空闲连接（若池为空则创建新连接并完成 HELLO 握手）
+    async fn get(&self) -> Result<AuthStream> {
+        if let Some(conn) = self.idle.lock().pop() {
             return Ok(conn);
         }
-        
-        // 创建新连接并完成HELLO握手
         let addr = format!("{}:{}", self.host, self.port);
         let mut stream = timeout(
             Duration::from_secs(self.timeout_secs),
-            TcpStream::connect(&addr)
-        ).await
-            .context("Connection timeout")?
-            .context("Failed to connect")?;
-        
-        // 发送HELLO握手（只做一次）
-        stream.write_all(&self.hello_template).await
-            .context("Failed to send HELLO")?;
-        
-        // 接收HELLO响应
-        let mut buf = vec![0u8; 1024];
-        timeout(
-            Duration::from_millis(1200),
-            stream.read(&mut buf)
-        ).await
-            .context("HELLO response timeout")?
-            .context("Failed to read HELLO response")?;
-        
-        Ok(AuthenticatedStream { stream })
+            TcpStream::connect(&addr),
+        )
+        .await
+        .context("连接超时")?
+        .with_context(|| format!("无法连接服务器 {addr}"))?;
+
+        stream
+            .write_all(&self.hello_bytes)
+            .await
+            .context("发送 HELLO 失败")?;
+        // 排空 HELLO 响应（超时接收）
+        recv_data(&mut stream, FIRST_BYTE_MS, 500)
+            .await
+            .context("接收 HELLO 响应失败")?;
+        debug!("新建连接 + HELLO 完成");
+        Ok(AuthStream { stream })
     }
-    
+
     /// 归还连接到池
-    fn return_connection(&self, conn: AuthenticatedStream) {
-        let mut pool = self.pool.lock();
-        if pool.len() < self.max_size {
-            pool.push(conn);
+    fn put(&self, conn: AuthStream) {
+        let mut idle = self.idle.lock();
+        if idle.len() < self.max_size {
+            idle.push(conn);
         }
-        // 否则连接被drop自动关闭
     }
 }
 
-/// 高性能TCP客户端（带连接池+HELLO复用）
+// ── 接收辅助 ─────────────────────────────────────────────────────────
+
+/// 超时接收（仅用于 HELLO 握手响应）：`first_ms` 等待首字节，`quiet_ms` 检测后续静默
+async fn recv_data(stream: &mut TcpStream, first_ms: u64, quiet_ms: u64) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(256 * 1024);
+    let mut chunk = vec![0u8; 16_384];
+
+    match timeout(Duration::from_millis(first_ms), stream.read(&mut chunk)).await {
+        Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+        Ok(Ok(_)) | Err(_) => return Ok(buf),
+        Ok(Err(e)) => return Err(e).context("读取 TCP 流失败"),
+    }
+
+    loop {
+        match timeout(Duration::from_millis(quiet_ms), stream.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            Ok(Ok(_)) | Err(_) => break,
+            Ok(Err(e)) => return Err(e).context("读取 TCP 流失败"),
+        }
+    }
+    Ok(buf)
+}
+
+/// 精确帧接收：读取 16 字节头，再按 body_len 精确读取体
+///
+/// 协议：每页响应起始 bytes[12..14] = body_len（u16 LE），总页大小 = 16 + body_len。
+///
+/// - 返回 `Ok(None)`：首字节 EOF 或超时，说明连接已关闭或不可用
+/// - 返回 `Ok(Some(bytes))`：完整帧（含头）
+/// - 返回 `Err`：IO 错误或超时，连接不可用
+async fn recv_page_exact(stream: &mut TcpStream, first_byte_ms: u64) -> Result<Option<Vec<u8>>> {
+    let mut header = [0u8; 16];
+    match timeout(
+        Duration::from_millis(first_byte_ms),
+        stream.read(&mut header[..1]),
+    )
+    .await
+    {
+        Ok(Ok(1)) => {}
+        Ok(Ok(_)) | Err(_) => return Ok(None),
+        Ok(Err(e)) => return Err(e).context("读取页首字节失败"),
+    }
+    // 读取剩余 15 字节头部
+    timeout(Duration::from_secs(2), stream.read_exact(&mut header[1..]))
+        .await
+        .map_err(|_| anyhow::anyhow!("读取页头超时（15字节）"))?
+        .context("读取页头失败")?;
+
+    if &header[0..4] != MAGIC {
+        return Ok(Some(header.to_vec()));
+    }
+
+    let body_len = u16::from_le_bytes([header[12], header[13]]) as usize;
+    if body_len == 0 {
+        return Ok(Some(header.to_vec()));
+    }
+
+    let mut body = vec![0u8; body_len];
+    timeout(Duration::from_secs(10), stream.read_exact(&mut body))
+        .await
+        .map_err(|_| anyhow::anyhow!("读取页体超时（body_len={body_len}）"))?
+        .context("读取页体失败")?;
+
+    let mut page = Vec::with_capacity(16 + body_len);
+    page.extend_from_slice(&header);
+    page.extend_from_slice(&body);
+    Ok(Some(page))
+}
+
+// ── 公开 API ─────────────────────────────────────────────────────────
+
+/// 高性能 TCP 客户端（带连接池 + HELLO 复用）
 pub struct HighPerfTcpClient {
-    pool: Arc<ConnectionPool>,
-    // 预解析的请求模板
+    pool: Arc<ConnPool>,
     request_template: Vec<u8>,
 }
 
 impl HighPerfTcpClient {
     pub fn new(host: String, port: u16, timeout_secs: u64, pool_size: usize) -> Result<Self> {
-        // 预解析模板
-        let hello_template = parse_hexdump(DEFAULT_HELLO)
-            .context("Failed to parse HELLO template")?;
-        let request_template = parse_hexdump(DEFAULT_REQUEST)
-            .context("Failed to parse REQUEST template")?;
-        
-        let pool = Arc::new(ConnectionPool::new(host, port, timeout_secs, pool_size, hello_template));
-        
+        let request_template =
+            parse_hexdump(DEFAULT_REQUEST).context("解析 REQUEST 模板失败")?;
+        let pool = Arc::new(ConnPool::new(
+            host,
+            port,
+            timeout_secs,
+            pool_size.max(DEFAULT_POOL_SIZE),
+        )?);
         Ok(Self {
             pool,
             request_template,
         })
     }
-    
-    /// 接收数据直到静默
-    /// - first_byte_ms: 等待服务器开始响应的最长时间（含查询时间）
-    /// - quiet_ms: 收到数据后，判断传输结束的静默超时（只需覆盖TCP分段间隔）
-    async fn recv_until_quiet(stream: &mut TcpStream, first_byte_ms: u64, quiet_ms: u64) -> Result<Vec<u8>> {
-        let mut buffer = Vec::with_capacity(256 * 1024);
-        let mut chunk = vec![0u8; 16384];
-        
-        // 第一次读：用较长的超时等待服务器开始响应
-        match timeout(Duration::from_millis(first_byte_ms), stream.read(&mut chunk)).await {
-            Ok(Ok(n)) if n > 0 => buffer.extend_from_slice(&chunk[..n]),
-            Ok(Ok(_)) => return Ok(buffer),
-            Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
-            Err(_) => return Ok(buffer), // 服务器无响应，返回空
-        }
-        
-        // 后续读：用短超时检测静默（数据已在传输中，只需等TCP分段间隔）
-        loop {
-            match timeout(Duration::from_millis(quiet_ms), stream.read(&mut chunk)).await {
-                Ok(Ok(n)) if n > 0 => buffer.extend_from_slice(&chunk[..n]),
-                Ok(Ok(_)) => break,
-                Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
-                Err(_) => break,
-            }
-        }
-        
-        Ok(buffer)
-    }
-    
-    /// 抓取数据（优化版：复用HELLO认证）
+
+    /// 抓取单只股票某天的分时数据
     pub async fn fetch(&self, code: &str, date: u32) -> Result<Vec<MarketData>> {
         let date_str = date.to_string();
-        
-        // 获取已认证的连接（HELLO已完成）
-        let mut conn = self.pool.get_connection().await?;
-        
-        // 复制并原地替换请求模板（无额外分配）
-        let mut request = self.request_template.clone();
-        replace_date_code(&mut request, &date_str, code)
-            .context("Failed to replace date/code in REQUEST")?;
-        
-        let mut all_responses = Vec::with_capacity(16);
+        debug!("开始抓取 {} {}", code, date_str);
+
+        let mut conn = self.pool.get().await?;
+
+        let mut req = self.request_template.clone();
+        replace_date_code(&mut req, &date_str, code).context("REQUEST 替换路径失败")?;
+
+        let mut all_pages: Vec<Vec<u8>> = Vec::new();
         let mut baseline_size: Option<usize> = None;
-        
-        // 分页循环（最多999页，与Python默认一致；实际由短页停判定提前终止）
-        // 注意：只更新pos1，pos2保持模板中的固定值不变（与Python版本行为一致）
+        let mut fetch_ok = true;
+
+        // ── 分页循环 ─────────────────────────────────────────────────
         for page in 0..99u32 {
-            // 更新offset（仅更新pos1）
-            write_u32_le(&mut request, OFFSET_POS1, DEFAULT_STEP * page)?;
-            
-            // 发送请求
-            conn.stream.write_all(&request).await?;
-            
-            // 接收响应：1000ms等待首字节（服务器查询时间），200ms检测后续静默
-            let response = Self::recv_until_quiet(&mut conn.stream, 1000, 200).await?;
-            let got = response.len();
-            
+            if let Err(e) = write_u32_le(&mut req, OFFSET_POS1, DEFAULT_STEP * page) {
+                warn!("写入偏移量失败: {}", e);
+                fetch_ok = false;
+                break;
+            }
+
+            if let Err(e) = conn.stream.write_all(&req).await {
+                warn!("发送 page={} 失败: {}", page, e);
+                fetch_ok = false;
+                break;
+            }
+
+            let resp = match recv_page_exact(&mut conn.stream, FIRST_BYTE_MS).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    debug!("连接无响应或已关闭，停止分页");
+                    fetch_ok = false;
+                    break;
+                }
+                Err(e) => {
+                    warn!("接收 page={} 失败: {}", page, e);
+                    fetch_ok = false;
+                    break;
+                }
+            };
+            let got = resp.len();
+            debug!("page={}: {} 字节", page, got);
+
             if got == 0 {
                 break;
             }
 
-            // 无 MAGIC 数据块 = 服务器已无有效数据（如"无数据"错误响应），无需继续翻页
-            if !response.windows(super::protocol::MAGIC.len())
-                .any(|w| w == super::protocol::MAGIC)
-            {
+            // 无 MAGIC 数据块 = 服务器已无有效数据
+            if !resp.windows(MAGIC.len()).any(|w| w == MAGIC) {
+                debug!("响应中无 MAGIC，停止分页");
+                fetch_ok = false;
                 break;
             }
-            
-            // 短页停判定
+
+            // 短页判断
             if let Some(baseline) = baseline_size {
-                let threshold = std::cmp::max((baseline as f64 * 0.6) as usize, baseline.saturating_sub(4096));
+                let threshold =
+                    (baseline.saturating_mul(3) / 5).max(baseline.saturating_sub(4096));
                 if got < threshold {
-                    all_responses.push(response);
+                    debug!("短页检测 got={} threshold={}，停止", got, threshold);
+                    all_pages.push(resp);
                     break;
                 }
             } else {
+                // 首页：若 ≤ 20 字节则为停牌空响应
+                if got <= 20 {
+                    debug!("空页响应（{}字节），股票可能停牌，停止分页", got);
+                    break;
+                }
                 baseline_size = Some(got);
             }
-            
-            all_responses.push(response);
-        }
-        
-        // 接收尾部数据：已收到数据，80ms静默即可排空
-        let _tail = Self::recv_until_quiet(&mut conn.stream, 80, 80).await.ok();
-        
-        // 归还连接（仍然保持HELLO认证状态）
-        self.pool.return_connection(conn);
-        
-        // 合并响应：第0页完整保留；第1+页若以MAGIC开头则去掉前20字节的分片头
-        // （与Python的merge_zlib_segments逻辑一致）
-        let total_size: usize = all_responses.iter().map(|r| r.len()).sum();
-        let mut combined_response = Vec::with_capacity(total_size);
-        for (i, resp) in all_responses.iter().enumerate() {
-            if i == 0 {
-                combined_response.extend_from_slice(resp);
-            } else if resp.len() > 20 && resp.starts_with(super::protocol::MAGIC) {
-                combined_response.extend_from_slice(&resp[20..]);
-            } else {
-                combined_response.extend_from_slice(resp);
+
+            all_pages.push(resp);
+
+            if all_pages.len() >= 200 {
+                warn!("{}_{} 达到页数上限 200，强制停止", code, date_str);
+                break;
             }
         }
-        
-        // 提取payload
-        let payloads = extract_payloads(&combined_response)?;
-        
-        // 解析所有payload（优化：预分配）
+
+        if fetch_ok {
+            self.pool.put(conn);
+        }
+
+        debug!("{}_{} 抓取完成，共 {} 页", code, date_str, all_pages.len());
+
+        if all_pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 直接拼接所有页（保留每页完整 MAGIC 头），由 extract_payloads 按 MAGIC 分块解压
+        let total: usize = all_pages.iter().map(Vec::len).sum();
+        let mut combined = Vec::with_capacity(total);
+        for page_data in &all_pages {
+            combined.extend_from_slice(page_data);
+        }
+
+        let payloads = extract_payloads(&combined).context("提取 payload 失败")?;
+
         let mut all_records = Vec::with_capacity(payloads.len() * 100);
         for payload in &payloads {
             let records = parse_payload(payload, date);
             all_records.extend(records);
         }
-        
+
         Ok(all_records)
     }
 }
